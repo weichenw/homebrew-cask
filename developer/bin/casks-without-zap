@@ -1,0 +1,89 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'open3'
+require 'optparse'
+require 'pathname'
+require 'tmpdir'
+
+# Exit cleanup
+Tmp_dir = Pathname.new(Dir.mktmpdir)
+at_exit { Tmp_dir.rmtree }
+
+# Constants
+Online_issue = 'https://github.com/Homebrew/homebrew-cask/issues/88469'
+Cask_repos = %w[homebrew-cask homebrew-cask-versions homebrew-cask-drivers].freeze
+Excluded_casks = %w[].freeze # Software which produces no settings files
+
+# Helpers
+def cask_name(cask_path)
+  cask_path.basename.sub(/\.rb$/, '')
+end
+
+def cask_url(tap_dir, cask_path)
+  tap_base = tap_dir.dirname.basename.to_path
+  cask_base = cask_path.basename.to_path
+
+  "https://github.com/Homebrew/#{tap_base}/blob/master/Casks/#{cask_base}"
+end
+
+# Options
+ARGV.push('--help') unless ARGV.include?('run')
+
+OptionParser.new do |parser|
+  parser.banner = <<~BANNER
+    Generates lists of casks missing `zap` in official repos, and copies it to replace the information on #{Online_issue}
+
+    Usage:
+      #{File.basename($PROGRAM_NAME)} run
+
+    The argument 'run' is necessary to prevent running the script by mistake.
+  BANNER
+end.parse!
+
+# Grab all taps and casks
+Cask_dirs = Cask_repos.each_with_object([]) do |repo, tap_dirs|
+  clone_dir = Tmp_dir.join(repo)
+  casks_dir = clone_dir.join('Casks')
+  tap_dirs.push(casks_dir)
+
+  system('git', 'clone', '--depth', '1', "https://github.com/Homebrew/#{repo}.git", clone_dir.to_path)
+end
+
+All_casks = Cask_dirs.each_with_object({}) { |tap_dir, casks|
+  casks[tap_dir] = []
+
+  # Populate hash with tap directory paths as keys
+  # and cask file paths as values in array
+  tap_dir.
+    children.
+    shuffle.
+    select { _1.extname == '.rb' }.
+    reject { Excluded_casks.include?(_1.basename('.rb').to_path) }.
+    each do casks[tap_dir].push(_1) end
+}
+
+Casks_no_zap = All_casks.each_with_object({}) { |(tap_dir, casks), without_zap|
+  without_zap[tap_dir] = []
+
+  # Populate hash with casks without a zap
+  casks.
+    reject { |file| file.readlines.any? { _1.start_with?(/\s+zap /) } }.
+    each do without_zap[tap_dir].push(_1) end
+
+  # Reject tap directory if there are no casks without zap
+  without_zap.delete(tap_dir) if without_zap[tap_dir].empty?
+}
+
+Cask_lists = Casks_no_zap.each_with_object([]) { |(tap_dir, casks), message|
+  message.push("<details><summary>#{tap_dir.dirname.basename.to_path}</summary>")
+  message.push('') # Empty line so the markdown still works inside the HTML
+
+  casks.each do message.push("- [ ] [`#{cask_name(_1)}`](#{cask_url(tap_dir, _1)})") end
+
+  message.push('</details>')
+}
+
+Open3.capture2('/usr/bin/pbcopy', stdin_data: "#{Cask_lists.join("\n")}\n")
+puts('Copied lists to clipboard. Replace the information in the issue.')
+system('open', Online_issue)
